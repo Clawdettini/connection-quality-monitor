@@ -1,0 +1,33 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Run unit tests
+        run: python3 test_connection_quality_monitor.py
+      - name: Compile executable
+        run: python3 -m py_compile connection-quality-monitor
+      - name: Smoke test SQLite storage and reports
+        run: |
+          ./connection-quality-monitor --once --quiet --out-dir /tmp/cqm-ci \
+            --ping-targets '' --dns-hosts '' --http-urls '' --download-url ''
+          python3 - <<'PY'
+          import sqlite3
+          con = sqlite3.connect('/tmp/cqm-ci/connection-quality.sqlite')
+          tables = {row[0] for row in con.execute("select name from sqlite_master where type='table'")}
+          assert 'samples' in tables
+          assert 'metadata' in tables
+          PY
+          ./connection-quality-monitor --report text --out-dir /tmp/cqm-ci | grep 'Connection Quality Report'
+          ./connection-quality-monitor --report json --out-dir /tmp/cqm-ci | python3 -m json.tool >/dev/null
+          ./connection-quality-monitor --html-report /tmp/cqm-ci/report.html --out-dir /tmp/cqm-ci --quiet
+          grep 'window.REPORT_DATA' /tmp/cqm-ci/report.html
