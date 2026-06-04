@@ -506,7 +506,7 @@ def format_report_text(report: Dict[str, Any]) -> str:
 
 
 def render_html_report(report: Dict[str, Any]) -> str:
-    payload = json.dumps(report, sort_keys=True)
+    payload = json.dumps(report, sort_keys=True).replace("</", "<\\/")
     safe_title = "Connection Quality Report"
     cards = "\n".join(
         f"<div class='card'><h3>{html.escape(name)}</h3><p>Samples: {stats.get('samples', 0)}</p><p>Failures: {stats.get('failures', 0)} ({stats.get('failure_pct', 0)}%)</p>"
@@ -570,7 +570,12 @@ drawSeries('secondary', 'throughput_mbps', '#4ade80', 'Throughput Mbps');
 const tbody = document.querySelector('#failures tbody');
 (window.REPORT_DATA.recent_failures || []).forEach(f => {{
   const tr = document.createElement('tr');
-  tr.innerHTML = `<td>${{f.timestamp_utc}}</td><td>${{f.check_type}}</td><td>${{f.target}}</td><td class="bad">${{f.error || 'failed'}}</td>`;
+  [f.timestamp_utc, f.check_type, f.target, f.error || 'failed'].forEach((value, index) => {{
+    const td = document.createElement('td');
+    td.textContent = value;
+    if (index === 3) td.className = 'bad';
+    tr.appendChild(td);
+  }});
   tbody.appendChild(tr);
 }});
 </script>

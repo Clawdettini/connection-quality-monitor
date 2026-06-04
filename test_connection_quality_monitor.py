@@ -103,6 +103,7 @@ class ReportingTests(unittest.TestCase):
             "failure_pct": 0.0,
             "time_range": {"start": "2026-06-04T20:00:00+00:00", "end": "2026-06-04T20:00:00+00:00"},
             "by_check_type": {"ping": {"samples": 1, "failures": 0, "latency_avg_ms": 10.0}},
+            "recent_failures": [{"timestamp_utc": "2026-06-04T20:00:00+00:00", "check_type": "http", "target": "</script><script>alert(1)</script>", "error": "<img src=x onerror=alert(1)>"}],
             "series": [{"timestamp_utc": "2026-06-04T20:00:00+00:00", "check_type": "ping", "target": "1.1.1.1", "ok": 1, "latency_ms": 10.0, "packet_loss_pct": 0.0, "throughput_mbps": None}],
         }
 
@@ -112,6 +113,8 @@ class ReportingTests(unittest.TestCase):
         self.assertIn("<canvas", html)
         self.assertIn("window.REPORT_DATA", html)
         self.assertIn("1.1.1.1", html)
+        self.assertNotIn("</script><script>alert(1)</script>", html)
+        self.assertIn("textContent = value", html)
 
 
 if __name__ == "__main__":
