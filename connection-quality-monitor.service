@@ -1,0 +1,13 @@
+[Unit]
+Description=Internet connection quality monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/connection-quality-monitor --interval 60 --out-dir /var/log/connection-quality
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

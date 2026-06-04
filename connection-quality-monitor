@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""
+connection_quality_monitor.py
+
+A small dependency-free executable for continuously measuring home internet
+connection quality and collecting evidence for ISP complaints.
+
+It records CSV + JSONL samples containing:
+- ICMP ping latency / packet loss / jitter to several public targets
+- DNS resolution time and failures
+- HTTP(S) response time and status
+- Optional small download throughput sample
+
+Run once:
+  ./connection_quality_monitor.py --once
+
+Run continuously, sampling every 60 seconds:
+  ./connection_quality_monitor.py --interval 60 --out-dir ./connection-quality-data
+
+The script uses only the Python standard library plus the system `ping` binary.
+If `ping` is unavailable or not permitted, DNS/HTTP/download checks still run.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import json
+import os
+import platform
+import re
+import shutil
+import signal
+import socket
+import statistics
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+DEFAULT_PING_TARGETS = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]
+DEFAULT_DNS_HOSTS = ["cloudflare.com", "google.com", "wikipedia.org"]
+DEFAULT_HTTP_URLS = [
+    "https://www.google.com/generate_204",
+    "https://www.gstatic.com/generate_204",
+    "https://www.wikipedia.org/",
+]
+DEFAULT_DOWNLOAD_URL = "https://speed.cloudflare.com/__down?bytes=1000000"  # 1 MB
+CSV_FIELDS = [
+    "timestamp_utc",
+    "local_time",
+    "check_type",
+    "target",
+    "ok",
+    "latency_ms",
+    "jitter_ms",
+    "packet_loss_pct",
+    "status_code",
+    "bytes",
+    "throughput_mbps",
+    "error",
+]
+STOP = False
+
+
+def now_utc() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def iso_local(t: Optional[dt.datetime] = None) -> str:
+    if t is None:
+        t = now_utc()
+    return t.astimezone().isoformat(timespec="seconds")
+
+
+def as_float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def split_csv(value: str) -> List[str]:
+    return [x.strip() for x in value.split(",") if x.strip()]
+
+
+def handle_signal(signum: int, frame: Any) -> None:  # noqa: ARG001
+    global STOP
+    STOP = True
+
+
+def run_ping(target: str, count: int, timeout_s: float) -> Dict[str, Any]:
+    if shutil.which("ping") is None:
+        return result("ping", target, False, error="ping binary not found")
+
+    # Linux ping: -n numeric, -c count, -W per-reply timeout seconds.
+    # macOS/BSD compatibility is best-effort; the Linux path is the intended server case.
+    timeout_arg = str(max(1, int(round(timeout_s))))
+    cmd = ["ping", "-n", "-c", str(count), "-W", timeout_arg, target]
+    start = time.monotonic()
+    try:
+        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=count * timeout_s + 3)
+    except subprocess.TimeoutExpired as e:
+        elapsed = (time.monotonic() - start) * 1000
+        return result("ping", target, False, latency_ms=elapsed, error=f"ping timeout: {e}")
+    except Exception as e:
+        return result("ping", target, False, error=str(e))
+
+    output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    packet_loss = None
+    loss_match = re.search(r"([0-9]+(?:\.[0-9]+)?)%\s*packet loss", output)
+    if loss_match:
+        packet_loss = float(loss_match.group(1))
+
+    # Linux: rtt min/avg/max/mdev = 6.917/7.312/7.926/0.290 ms
+    # BusyBox can print: round-trip min/avg/max = ...
+    latency_ms = None
+    jitter_ms = None
+    rtt_match = re.search(r"(?:rtt|round-trip).*?=\s*([0-9.]+)/([0-9.]+)/([0-9.]+)(?:/([0-9.]+))?\s*ms", output)
+    if rtt_match:
+        latency_ms = float(rtt_match.group(2))
+        jitter_ms = float(rtt_match.group(4)) if rtt_match.group(4) else (float(rtt_match.group(3)) - float(rtt_match.group(1)))
+    else:
+        times = [float(x) for x in re.findall(r"time=([0-9.]+)\s*ms", output)]
+        if times:
+            latency_ms = statistics.mean(times)
+            jitter_ms = statistics.pstdev(times) if len(times) > 1 else 0.0
+
+    ok = proc.returncode == 0 and (packet_loss is None or packet_loss < 100) and latency_ms is not None
+    err = None if ok else compact_error(output) or f"ping exited {proc.returncode}"
+    return result("ping", target, ok, latency_ms=latency_ms, jitter_ms=jitter_ms, packet_loss_pct=packet_loss, error=err)
+
+
+def compact_error(text: str, limit: int = 220) -> str:
+    text = " ".join(line.strip() for line in text.splitlines() if line.strip())
+    return text[:limit]
+
+
+def run_dns(host: str, timeout_s: float) -> Dict[str, Any]:
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(timeout_s)
+    start = time.monotonic()
+    try:
+        answers = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        elapsed = (time.monotonic() - start) * 1000
+        return result("dns", host, bool(answers), latency_ms=elapsed, bytes=len(answers))
+    except Exception as e:
+        elapsed = (time.monotonic() - start) * 1000
+        return result("dns", host, False, latency_ms=elapsed, error=str(e))
+    finally:
+        socket.setdefaulttimeout(old_timeout)
+
+
+def run_http(url: str, timeout_s: float) -> Dict[str, Any]:
+    start = time.monotonic()
+    req = urllib.request.Request(url, method="GET", headers={"User-Agent": "connection-quality-monitor/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            # Read a tiny amount to make sure the response body starts arriving.
+            data = resp.read(4096)
+            elapsed = (time.monotonic() - start) * 1000
+            status = getattr(resp, "status", None)
+            return result("http", url, 200 <= int(status or 0) < 400, latency_ms=elapsed, status_code=status, bytes=len(data))
+    except Exception as e:
+        elapsed = (time.monotonic() - start) * 1000
+        return result("http", url, False, latency_ms=elapsed, error=str(e))
+
+
+def run_download(url: str, timeout_s: float, max_bytes: int) -> Dict[str, Any]:
+    start = time.monotonic()
+    req = urllib.request.Request(url, headers={"User-Agent": "connection-quality-monitor/1.0"})
+    total = 0
+    status = None
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            status = getattr(resp, "status", None)
+            while total < max_bytes:
+                chunk = resp.read(min(65536, max_bytes - total))
+                if not chunk:
+                    break
+                total += len(chunk)
+        elapsed_s = max(time.monotonic() - start, 0.001)
+        mbps = (total * 8) / elapsed_s / 1_000_000
+        ok = total > 0 and 200 <= int(status or 0) < 400
+        return result("download", url, ok, latency_ms=elapsed_s * 1000, status_code=status, bytes=total, throughput_mbps=mbps)
+    except Exception as e:
+        elapsed_s = max(time.monotonic() - start, 0.001)
+        mbps = (total * 8) / elapsed_s / 1_000_000 if total else None
+        return result("download", url, False, latency_ms=elapsed_s * 1000, status_code=status, bytes=total, throughput_mbps=mbps, error=str(e))
+
+
+def result(check_type: str, target: str, ok: bool, **kwargs: Any) -> Dict[str, Any]:
+    t = now_utc()
+    row: Dict[str, Any] = {
+        "timestamp_utc": t.isoformat(timespec="seconds"),
+        "local_time": iso_local(t),
+        "check_type": check_type,
+        "target": target,
+        "ok": bool(ok),
+        "latency_ms": None,
+        "jitter_ms": None,
+        "packet_loss_pct": None,
+        "status_code": None,
+        "bytes": None,
+        "throughput_mbps": None,
+        "error": None,
+    }
+    row.update(kwargs)
+    for key in ("latency_ms", "jitter_ms", "packet_loss_pct", "throughput_mbps"):
+        if row.get(key) is not None:
+            row[key] = round(float(row[key]), 3)
+    return row
+
+
+def sample(args: argparse.Namespace) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for target in args.ping_targets:
+        rows.append(run_ping(target, args.ping_count, args.timeout))
+    for host in args.dns_hosts:
+        rows.append(run_dns(host, args.timeout))
+    for url in args.http_urls:
+        rows.append(run_http(url, args.timeout))
+    if args.download_url and args.download_bytes > 0:
+        rows.append(run_download(args.download_url, args.timeout, args.download_bytes))
+    return rows
+
+
+def ensure_outputs(out_dir: Path) -> Tuple[Path, Path]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    day = dt.datetime.now().strftime("%Y-%m-%d")
+    return out_dir / f"connection-quality-{day}.csv", out_dir / f"connection-quality-{day}.jsonl"
+
+
+def append_rows(out_dir: Path, rows: Iterable[Dict[str, Any]]) -> None:
+    csv_path, jsonl_path = ensure_outputs(out_dir)
+    csv_exists = csv_path.exists()
+    with csv_path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        if not csv_exists:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k) for k in CSV_FIELDS})
+    with jsonl_path.open("a", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def print_summary(rows: List[Dict[str, Any]]) -> None:
+    total = len(rows)
+    failed = [r for r in rows if not r.get("ok")]
+    pings = [r for r in rows if r.get("check_type") == "ping"]
+    download = [r for r in rows if r.get("check_type") == "download" and r.get("throughput_mbps") is not None]
+    ping_latencies = [as_float(r.get("latency_ms")) for r in pings if r.get("ok") and r.get("latency_ms") is not None]
+    ping_latencies = [x for x in ping_latencies if x is not None]
+    parts = [f"{dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} checks={total} failures={len(failed)}"]
+    if ping_latencies:
+        parts.append(f"ping_avg_ms={statistics.mean(ping_latencies):.1f}")
+    if download:
+        parts.append(f"download_mbps={download[-1]['throughput_mbps']:.1f}")
+    if failed:
+        parts.append("failed=" + ", ".join(f"{r['check_type']}:{r['target']}" for r in failed[:4]))
+    print(" | ".join(parts), flush=True)
+
+
+def write_metadata(out_dir: Path, args: argparse.Namespace) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    metadata = {
+        "created_utc": now_utc().isoformat(timespec="seconds"),
+        "host": socket.gethostname(),
+        "platform": platform.platform(),
+        "python": sys.version.split()[0],
+        "config": {
+            "interval": args.interval,
+            "timeout": args.timeout,
+            "ping_targets": args.ping_targets,
+            "dns_hosts": args.dns_hosts,
+            "http_urls": args.http_urls,
+            "download_url": args.download_url,
+            "download_bytes": args.download_bytes,
+            "ping_count": args.ping_count,
+        },
+    }
+    path = out_dir / "metadata.json"
+    if not path.exists():
+        path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def parse_args(argv: List[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Continuously measure internet connection quality and log evidence.")
+    p.add_argument("--out-dir", default="./connection-quality-data", help="Directory for daily CSV/JSONL logs.")
+    p.add_argument("--interval", type=float, default=60.0, help="Seconds between samples when running continuously.")
+    p.add_argument("--timeout", type=float, default=8.0, help="Timeout per network check in seconds.")
+    p.add_argument("--once", action="store_true", help="Run a single sample and exit.")
+    p.add_argument("--ping-targets", default=",".join(DEFAULT_PING_TARGETS), help="Comma-separated ICMP ping targets. Use empty string to disable.")
+    p.add_argument("--ping-count", type=int, default=5, help="Ping packets per target per sample.")
+    p.add_argument("--dns-hosts", default=",".join(DEFAULT_DNS_HOSTS), help="Comma-separated DNS hostnames. Use empty string to disable.")
+    p.add_argument("--http-urls", default=",".join(DEFAULT_HTTP_URLS), help="Comma-separated HTTP(S) URLs. Use empty string to disable.")
+    p.add_argument("--download-url", default=DEFAULT_DOWNLOAD_URL, help="URL for small throughput test. Use empty string to disable.")
+    p.add_argument("--download-bytes", type=int, default=1_000_000, help="Maximum bytes to read for throughput test.")
+    p.add_argument("--quiet", action="store_true", help="Do not print per-sample summaries.")
+    args = p.parse_args(argv)
+    args.ping_targets = split_csv(args.ping_targets)
+    args.dns_hosts = split_csv(args.dns_hosts)
+    args.http_urls = split_csv(args.http_urls)
+    if args.ping_count < 1:
+        args.ping_count = 1
+    if args.interval < 1:
+        args.interval = 1
+    return args
+
+
+def main(argv: List[str]) -> int:
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+    args = parse_args(argv)
+    out_dir = Path(args.out_dir).expanduser().resolve()
+    write_metadata(out_dir, args)
+
+    while not STOP:
+        started = time.monotonic()
+        rows = sample(args)
+        append_rows(out_dir, rows)
+        if not args.quiet:
+            print_summary(rows)
+        if args.once:
+            break
+        elapsed = time.monotonic() - started
+        sleep_for = max(0.0, args.interval - elapsed)
+        end = time.monotonic() + sleep_for
+        while not STOP and time.monotonic() < end:
+            time.sleep(min(0.5, end - time.monotonic()))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
