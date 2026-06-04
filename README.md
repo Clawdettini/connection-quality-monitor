@@ -4,9 +4,11 @@ A small, self-contained executable for continuously measuring home internet conn
 
 It uses only Python's standard library plus the system `ping` command. No Python packages are required.
 
+By default it stores samples in a SQLite database: `connection-quality.sqlite`. CSV/JSONL output remains available with `--storage files` or `--storage both`.
+
 ## What it records
 
-Each sample writes CSV and JSONL rows with:
+Each sample writes SQLite rows with:
 
 - ICMP ping latency, jitter, and packet loss
 - DNS resolution latency and failures
@@ -78,15 +80,17 @@ journalctl -u connection-quality-monitor.service -n 50
 Data will be written to:
 
 ```text
-/var/log/connection-quality/connection-quality-YYYY-MM-DD.csv
-/var/log/connection-quality/connection-quality-YYYY-MM-DD.jsonl
-/var/log/connection-quality/metadata.json
+/var/log/connection-quality/connection-quality.sqlite
 ```
+
+To also keep daily CSV/JSONL files, add `--storage both` to the service `ExecStart`.
 
 ## Command line options
 
 ```text
---out-dir DIR              Directory for daily CSV/JSONL logs
+--out-dir DIR              Directory for logs and default SQLite database
+--storage MODE             sqlite (default), files for CSV/JSONL, or both
+--db-path PATH             SQLite database path; defaults to OUT_DIR/connection-quality.sqlite
 --interval SECONDS         Seconds between samples, default 60
 --timeout SECONDS          Timeout per network check, default 8
 --once                     Run a single sample and exit
@@ -111,7 +115,23 @@ connection-quality-monitor \
 
 ## Notes for ISP complaints
 
-The CSV file is usually easiest to attach or summarize. Useful columns include:
+The SQLite database is easiest to query locally. Example:
+
+```bash
+sqlite3 /var/log/connection-quality/connection-quality.sqlite \
+  "SELECT timestamp_utc, check_type, target, ok, latency_ms, packet_loss_pct, throughput_mbps, error FROM samples ORDER BY id DESC LIMIT 20;"
+```
+
+If your ISP wants spreadsheet-style evidence, either export from SQLite:
+
+```bash
+sqlite3 -header -csv /var/log/connection-quality/connection-quality.sqlite \
+  "SELECT * FROM samples;" > connection-quality.csv
+```
+
+Or run the monitor with `--storage both` to create daily CSV files automatically.
+
+Useful columns include:
 
 - `timestamp_utc` / `local_time`
 - `check_type`
