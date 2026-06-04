@@ -101,6 +101,9 @@ To also keep daily CSV/JSONL files, add `--storage both` to the service `ExecSta
 --download-url URL         URL for small throughput test; empty disables download
 --download-bytes N         Max bytes for throughput test, default 1000000
 --quiet                    Do not print per-sample summaries
+--report text|json         Print statistics from SQLite and exit
+--html-report PATH         Write a self-contained HTML visualization and exit
+--since ISO_TIMESTAMP      Restrict reports to samples at/after this timestamp
 ```
 
 Example with custom targets:
@@ -112,6 +115,34 @@ connection-quality-monitor \
   --dns-hosts cloudflare.com,google.com \
   --out-dir ~/connection-quality-data
 ```
+
+## Reporting and visualization
+
+Print a text summary:
+
+```bash
+connection-quality-monitor --report text --out-dir /var/log/connection-quality
+```
+
+Print machine-readable JSON:
+
+```bash
+connection-quality-monitor --report json --out-dir /var/log/connection-quality
+```
+
+Create a self-contained HTML dashboard:
+
+```bash
+connection-quality-monitor --html-report ~/connection-quality-report.html --out-dir /var/log/connection-quality
+```
+
+Restrict a report to newer samples:
+
+```bash
+connection-quality-monitor --report text --since 2026-06-01T00:00:00+00:00 --out-dir /var/log/connection-quality
+```
+
+The HTML report embeds the SQLite-derived data and uses browser canvas charts, so it can be copied or opened without a web server.
 
 ## Notes for ISP complaints
 

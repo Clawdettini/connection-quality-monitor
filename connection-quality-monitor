@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import html
 import json
 import os
 import platform
@@ -353,6 +354,230 @@ def write_metadata_sqlite(db_path: Path, args: argparse.Namespace) -> None:
         )
 
 
+def round_or_none(value: Any, digits: int = 3) -> Optional[float]:
+    if value is None:
+        return None
+    return round(float(value), digits)
+
+
+def build_report(db_path: Path, since: str = "", limit_series: int = 2000) -> Dict[str, Any]:
+    init_sqlite(db_path)
+    where = "WHERE timestamp_utc >= ?" if since else ""
+    params: Tuple[Any, ...] = (since,) if since else ()
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        totals = conn.execute(
+            f"""
+            SELECT COUNT(*) AS total_samples,
+                   SUM(CASE WHEN ok THEN 0 ELSE 1 END) AS failure_count,
+                   MIN(timestamp_utc) AS start_time,
+                   MAX(timestamp_utc) AS end_time
+            FROM samples {where}
+            """,
+            params,
+        ).fetchone()
+        by_check_rows = conn.execute(
+            f"""
+            SELECT check_type,
+                   COUNT(*) AS samples,
+                   SUM(CASE WHEN ok THEN 0 ELSE 1 END) AS failures,
+                   AVG(latency_ms) AS latency_avg_ms,
+                   MIN(latency_ms) AS latency_min_ms,
+                   MAX(latency_ms) AS latency_max_ms,
+                   AVG(packet_loss_pct) AS packet_loss_avg_pct,
+                   AVG(throughput_mbps) AS throughput_avg_mbps
+            FROM samples {where}
+            GROUP BY check_type
+            ORDER BY check_type
+            """,
+            params,
+        ).fetchall()
+        by_target_rows = conn.execute(
+            f"""
+            SELECT check_type, target,
+                   COUNT(*) AS samples,
+                   SUM(CASE WHEN ok THEN 0 ELSE 1 END) AS failures,
+                   AVG(latency_ms) AS latency_avg_ms,
+                   AVG(packet_loss_pct) AS packet_loss_avg_pct,
+                   AVG(throughput_mbps) AS throughput_avg_mbps
+            FROM samples {where}
+            GROUP BY check_type, target
+            ORDER BY check_type, target
+            """,
+            params,
+        ).fetchall()
+        series_rows = conn.execute(
+            f"""
+            SELECT timestamp_utc, check_type, target, ok, latency_ms,
+                   packet_loss_pct, throughput_mbps, error
+            FROM samples {where}
+            ORDER BY timestamp_utc DESC, id DESC
+            LIMIT ?
+            """,
+            (*params, limit_series),
+        ).fetchall()
+        recent_failures = conn.execute(
+            f"""
+            SELECT timestamp_utc, check_type, target, latency_ms, packet_loss_pct, error
+            FROM samples {where} AND ok = 0
+            ORDER BY timestamp_utc DESC, id DESC
+            LIMIT 20
+            """ if since else """
+            SELECT timestamp_utc, check_type, target, latency_ms, packet_loss_pct, error
+            FROM samples WHERE ok = 0
+            ORDER BY timestamp_utc DESC, id DESC
+            LIMIT 20
+            """,
+            params,
+        ).fetchall()
+
+    total_samples = int(totals["total_samples"] or 0)
+    failure_count = int(totals["failure_count"] or 0)
+    report = {
+        "database": str(db_path),
+        "generated_utc": now_utc().isoformat(timespec="seconds"),
+        "total_samples": total_samples,
+        "failure_count": failure_count,
+        "failure_pct": round((failure_count / total_samples * 100), 3) if total_samples else 0.0,
+        "time_range": {"start": totals["start_time"], "end": totals["end_time"]},
+        "by_check_type": {},
+        "by_target": [],
+        "recent_failures": [dict(row) for row in recent_failures],
+        "series": [dict(row) for row in reversed(series_rows)],
+    }
+    for row in by_check_rows:
+        samples = int(row["samples"] or 0)
+        failures = int(row["failures"] or 0)
+        report["by_check_type"][row["check_type"]] = {
+            "samples": samples,
+            "failures": failures,
+            "failure_pct": round((failures / samples * 100), 3) if samples else 0.0,
+            "latency_avg_ms": round_or_none(row["latency_avg_ms"]),
+            "latency_min_ms": round_or_none(row["latency_min_ms"]),
+            "latency_max_ms": round_or_none(row["latency_max_ms"]),
+            "packet_loss_avg_pct": round_or_none(row["packet_loss_avg_pct"]),
+            "throughput_avg_mbps": round_or_none(row["throughput_avg_mbps"]),
+        }
+    for row in by_target_rows:
+        samples = int(row["samples"] or 0)
+        failures = int(row["failures"] or 0)
+        report["by_target"].append(
+            {
+                "check_type": row["check_type"],
+                "target": row["target"],
+                "samples": samples,
+                "failures": failures,
+                "failure_pct": round((failures / samples * 100), 3) if samples else 0.0,
+                "latency_avg_ms": round_or_none(row["latency_avg_ms"]),
+                "packet_loss_avg_pct": round_or_none(row["packet_loss_avg_pct"]),
+                "throughput_avg_mbps": round_or_none(row["throughput_avg_mbps"]),
+            }
+        )
+    return report
+
+
+def format_report_text(report: Dict[str, Any]) -> str:
+    lines = [
+        "Connection Quality Report",
+        f"Database: {report['database']}",
+        f"Generated UTC: {report['generated_utc']}",
+        f"Range: {report['time_range']['start']} -> {report['time_range']['end']}",
+        f"Samples: {report['total_samples']} | Failures: {report['failure_count']} ({report['failure_pct']}%)",
+        "",
+        "By check type:",
+    ]
+    for check_type, stats in report["by_check_type"].items():
+        parts = [
+            f"- {check_type}: samples={stats['samples']}",
+            f"failures={stats['failures']} ({stats['failure_pct']}%)",
+        ]
+        if stats.get("latency_avg_ms") is not None:
+            parts.append(f"avg_latency={stats['latency_avg_ms']}ms")
+        if stats.get("packet_loss_avg_pct") is not None:
+            parts.append(f"avg_loss={stats['packet_loss_avg_pct']}%")
+        if stats.get("throughput_avg_mbps") is not None:
+            parts.append(f"avg_throughput={stats['throughput_avg_mbps']}Mbps")
+        lines.append(" | ".join(parts))
+    if report.get("recent_failures"):
+        lines.extend(["", "Recent failures:"])
+        for failure in report["recent_failures"][:10]:
+            lines.append(f"- {failure['timestamp_utc']} {failure['check_type']} {failure['target']}: {failure.get('error') or 'failed'}")
+    return "\n".join(lines)
+
+
+def render_html_report(report: Dict[str, Any]) -> str:
+    payload = json.dumps(report, sort_keys=True)
+    safe_title = "Connection Quality Report"
+    cards = "\n".join(
+        f"<div class='card'><h3>{html.escape(name)}</h3><p>Samples: {stats.get('samples', 0)}</p><p>Failures: {stats.get('failures', 0)} ({stats.get('failure_pct', 0)}%)</p>"
+        f"<p>Avg latency: {stats.get('latency_avg_ms') if stats.get('latency_avg_ms') is not None else 'n/a'} ms</p>"
+        f"<p>Avg loss: {stats.get('packet_loss_avg_pct') if stats.get('packet_loss_avg_pct') is not None else 'n/a'}%</p>"
+        f"<p>Avg throughput: {stats.get('throughput_avg_mbps') if stats.get('throughput_avg_mbps') is not None else 'n/a'} Mbps</p></div>"
+        for name, stats in report.get("by_check_type", {}).items()
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{safe_title}</title>
+<style>
+body {{ font-family: system-ui, -apple-system, Segoe UI, sans-serif; margin: 2rem; background: #0f172a; color: #e2e8f0; }}
+.card {{ background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 1rem; margin: .5rem; min-width: 220px; }}
+.cards {{ display: flex; flex-wrap: wrap; }}
+canvas {{ width: 100%; max-width: 1100px; height: 320px; background: #111827; border: 1px solid #334155; border-radius: 12px; margin: 1rem 0; }}
+table {{ border-collapse: collapse; width: 100%; margin-top: 1rem; }}
+th, td {{ border-bottom: 1px solid #334155; padding: .45rem; text-align: left; }}
+.bad {{ color: #f87171; }} .good {{ color: #4ade80; }}
+</style>
+</head>
+<body>
+<h1>{safe_title}</h1>
+<p>Database: {html.escape(str(report.get('database', '')))}</p>
+<p>Range: {html.escape(str(report.get('time_range', {}).get('start')))} → {html.escape(str(report.get('time_range', {}).get('end')))}</p>
+<h2>Overview</h2>
+<div class="cards">
+<div class="card"><h3>Total samples</h3><p>{report.get('total_samples', 0)}</p></div>
+<div class="card"><h3>Failures</h3><p>{report.get('failure_count', 0)} ({report.get('failure_pct', 0)}%)</p></div>
+{cards}
+</div>
+<h2>Latency over time</h2>
+<canvas id="latency" width="1100" height="320"></canvas>
+<h2>Packet loss / throughput over time</h2>
+<canvas id="secondary" width="1100" height="320"></canvas>
+<h2>Recent failures</h2>
+<table id="failures"><thead><tr><th>Time</th><th>Type</th><th>Target</th><th>Error</th></tr></thead><tbody></tbody></table>
+<script>
+window.REPORT_DATA = {payload};
+function drawSeries(canvasId, field, color, label) {{
+  const canvas = document.getElementById(canvasId), ctx = canvas.getContext('2d');
+  const rows = window.REPORT_DATA.series.filter(r => r[field] !== null && r[field] !== undefined);
+  ctx.clearRect(0,0,canvas.width,canvas.height); ctx.strokeStyle = '#334155'; ctx.fillStyle = '#94a3b8';
+  ctx.fillText(label, 14, 22);
+  for (let i=0;i<5;i++) {{ const y=40+i*55; ctx.beginPath(); ctx.moveTo(40,y); ctx.lineTo(canvas.width-20,y); ctx.stroke(); }}
+  if (!rows.length) {{ ctx.fillText('No data', 50, 80); return; }}
+  const vals = rows.map(r => Number(r[field])); const max = Math.max(...vals, 1); const min = Math.min(...vals, 0);
+  ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath();
+  rows.forEach((r, i) => {{
+    const x = 45 + (i / Math.max(rows.length - 1, 1)) * (canvas.width - 70);
+    const y = canvas.height - 35 - ((Number(r[field]) - min) / Math.max(max - min, 1)) * (canvas.height - 70);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }});
+  ctx.stroke(); ctx.fillStyle = '#e2e8f0'; ctx.fillText(`min ${{min.toFixed(2)}} / max ${{max.toFixed(2)}}`, 14, canvas.height - 12);
+}}
+drawSeries('latency', 'latency_ms', '#38bdf8', 'Latency ms');
+drawSeries('secondary', 'throughput_mbps', '#4ade80', 'Throughput Mbps');
+const tbody = document.querySelector('#failures tbody');
+(window.REPORT_DATA.recent_failures || []).forEach(f => {{
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${{f.timestamp_utc}}</td><td>${{f.check_type}}</td><td>${{f.target}}</td><td class="bad">${{f.error || 'failed'}}</td>`;
+  tbody.appendChild(tr);
+}});
+</script>
+</body>
+</html>"""
+
+
 def print_summary(rows: List[Dict[str, Any]]) -> None:
     total = len(rows)
     failed = [r for r in rows if not r.get("ok")]
@@ -408,6 +633,9 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--download-url", default=DEFAULT_DOWNLOAD_URL, help="URL for small throughput test. Use empty string to disable.")
     p.add_argument("--download-bytes", type=int, default=1_000_000, help="Maximum bytes to read for throughput test.")
     p.add_argument("--quiet", action="store_true", help="Do not print per-sample summaries.")
+    p.add_argument("--report", choices=("text", "json"), help="Print a statistics report from the SQLite database and exit.")
+    p.add_argument("--html-report", default="", help="Write a self-contained HTML visualization report and exit.")
+    p.add_argument("--since", default="", help="Only include samples with timestamp_utc >= this ISO timestamp in reports.")
     args = p.parse_args(argv)
     args.ping_targets = split_csv(args.ping_targets)
     args.dns_hosts = split_csv(args.dns_hosts)
@@ -425,6 +653,19 @@ def main(argv: List[str]) -> int:
     args = parse_args(argv)
     out_dir = Path(args.out_dir).expanduser().resolve()
     db_path = Path(args.db_path).expanduser().resolve() if args.db_path else out_dir / "connection-quality.sqlite"
+    if args.report or args.html_report:
+        report = build_report(db_path, since=args.since)
+        if args.report == "json":
+            print(json.dumps(report, indent=2, sort_keys=True))
+        elif args.report == "text":
+            print(format_report_text(report))
+        if args.html_report:
+            html_path = Path(args.html_report).expanduser().resolve()
+            html_path.parent.mkdir(parents=True, exist_ok=True)
+            html_path.write_text(render_html_report(report), encoding="utf-8")
+            if not args.quiet:
+                print(f"Wrote HTML report: {html_path}")
+        return 0
     if args.storage in ("sqlite", "both"):
         write_metadata_sqlite(db_path, args)
     if args.storage in ("files", "both"):
