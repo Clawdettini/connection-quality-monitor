@@ -5,9 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/connection-quality-monitor --interval 60 --out-dir /var/log/connection-quality
+ExecStart=/usr/local/bin/connection-quality-monitor --interval 60 --out-dir /var/log/connection-quality --storage sqlite --db-path /var/log/connection-quality/connection-quality.sqlite
 Restart=always
 RestartSec=10
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
