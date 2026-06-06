@@ -67,12 +67,18 @@ CSV_FIELDS = [
     "error",
 ]
 SQLITE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS targets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    check_type TEXT NOT NULL,
+    target TEXT NOT NULL,
+    UNIQUE(check_type, target)
+);
+
 CREATE TABLE IF NOT EXISTS samples (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp_utc TEXT NOT NULL,
     local_time TEXT NOT NULL,
-    check_type TEXT NOT NULL,
-    target TEXT NOT NULL,
+    target_id INTEGER NOT NULL REFERENCES targets(id),
     ok INTEGER NOT NULL,
     latency_ms REAL,
     jitter_ms REAL,
@@ -85,7 +91,8 @@ CREATE TABLE IF NOT EXISTS samples (
 );
 
 CREATE INDEX IF NOT EXISTS idx_samples_timestamp ON samples(timestamp_utc);
-CREATE INDEX IF NOT EXISTS idx_samples_check_target ON samples(check_type, target);
+CREATE INDEX IF NOT EXISTS idx_samples_target ON samples(target_id);
+CREATE INDEX IF NOT EXISTS idx_targets_check_target ON targets(check_type, target);
 
 CREATE TABLE IF NOT EXISTS metadata (
     key TEXT PRIMARY KEY,
@@ -93,6 +100,10 @@ CREATE TABLE IF NOT EXISTS metadata (
     updated_at_utc TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 """
+SECONDS_PER_YEAR = 365 * 24 * 60 * 60
+SQLITE_ESTIMATED_BYTES_PER_ROW = 210.0
+CSV_ESTIMATED_BYTES_PER_ROW = 104.0
+JSONL_ESTIMATED_BYTES_PER_ROW = 300.0
 STOP = False
 
 
@@ -245,7 +256,7 @@ def result(check_type: str, target: str, ok: bool, **kwargs: Any) -> Dict[str, A
     return row
 
 
-def sample(args: argparse.Namespace) -> List[Dict[str, Any]]:
+def sample(args: argparse.Namespace, include_download: bool = True) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for target in args.ping_targets:
         rows.append(run_ping(target, args.ping_count, args.timeout))
@@ -253,9 +264,61 @@ def sample(args: argparse.Namespace) -> List[Dict[str, Any]]:
         rows.append(run_dns(host, args.timeout))
     for url in args.http_urls:
         rows.append(run_http(url, args.timeout))
-    if args.download_url and args.download_bytes > 0:
+    if include_download and args.download_url and args.download_bytes > 0:
         rows.append(run_download(args.download_url, args.timeout, args.download_bytes))
     return rows
+
+
+def should_run_download(args: argparse.Namespace, sample_number: int, elapsed_s: float) -> bool:
+    if not args.download_url or args.download_bytes <= 0:
+        return False
+    if args.download_every <= 0:
+        return True
+    if sample_number == 0:
+        return True
+    previous_elapsed = max(0.0, elapsed_s - args.interval)
+    return int(elapsed_s // args.download_every) > int(previous_elapsed // args.download_every)
+
+
+def estimate_storage(args: argparse.Namespace) -> Dict[str, Any]:
+    samples_per_year = int(SECONDS_PER_YEAR // args.interval)
+    base_checks_per_sample = len(args.ping_targets) + len(args.dns_hosts) + len(args.http_urls)
+    if args.download_url and args.download_bytes > 0:
+        if args.download_every <= 0:
+            download_checks_per_year = samples_per_year
+        else:
+            download_checks_per_year = int(SECONDS_PER_YEAR // args.download_every)
+    else:
+        download_checks_per_year = 0
+    rows_per_year = samples_per_year * base_checks_per_sample + download_checks_per_year
+    return {
+        "interval_seconds": args.interval,
+        "checks_per_sample": base_checks_per_sample,
+        "samples_per_year": samples_per_year,
+        "download_every_seconds": args.download_every,
+        "download_checks_per_year": download_checks_per_year,
+        "rows_per_year": rows_per_year,
+        "sqlite_estimated_mib_per_year": round(rows_per_year * SQLITE_ESTIMATED_BYTES_PER_ROW / 1024 / 1024, 3),
+        "csv_estimated_mib_per_year": round(rows_per_year * CSV_ESTIMATED_BYTES_PER_ROW / 1024 / 1024, 3),
+        "jsonl_estimated_mib_per_year": round(rows_per_year * JSONL_ESTIMATED_BYTES_PER_ROW / 1024 / 1024, 3),
+        "download_traffic_gib_per_year": round(download_checks_per_year * args.download_bytes / 1024 / 1024 / 1024, 3),
+    }
+
+
+def format_storage_estimate(estimate: Dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "Connection Quality Monitor storage estimate (365 days)",
+            f"Interval: {estimate['interval_seconds']} seconds",
+            f"Samples/year: {estimate['samples_per_year']:,}",
+            f"Rows/year: {estimate['rows_per_year']:,}",
+            f"Download checks/year: {estimate['download_checks_per_year']:,}",
+            f"Estimated SQLite: {estimate['sqlite_estimated_mib_per_year']:.1f} MiB/year",
+            f"Estimated CSV: {estimate['csv_estimated_mib_per_year']:.1f} MiB/year",
+            f"Estimated JSONL: {estimate['jsonl_estimated_mib_per_year']:.1f} MiB/year",
+            f"Estimated download traffic: {estimate['download_traffic_gib_per_year']:.1f} GiB/year",
+        ]
+    )
 
 
 def ensure_outputs(out_dir: Path) -> Tuple[Path, Path]:
@@ -281,39 +344,104 @@ def append_rows(out_dir: Path, rows: Iterable[Dict[str, Any]]) -> None:
 def init_sqlite(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_path) as conn:
+        migrate_legacy_sqlite(conn)
         conn.executescript(SQLITE_SCHEMA)
+
+
+def migrate_legacy_sqlite(conn: sqlite3.Connection) -> None:
+    samples_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'samples'"
+    ).fetchone()
+    if not samples_exists:
+        return
+    sample_columns = [row[1] for row in conn.execute("PRAGMA table_info(samples)").fetchall()]
+    if "target_id" in sample_columns or "target" not in sample_columns:
+        return
+    conn.executescript(
+        """
+        ALTER TABLE samples RENAME TO samples_legacy;
+        CREATE TABLE IF NOT EXISTS targets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            check_type TEXT NOT NULL,
+            target TEXT NOT NULL,
+            UNIQUE(check_type, target)
+        );
+        INSERT OR IGNORE INTO targets(check_type, target)
+        SELECT DISTINCT check_type, target FROM samples_legacy;
+        CREATE TABLE samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp_utc TEXT NOT NULL,
+            local_time TEXT NOT NULL,
+            target_id INTEGER NOT NULL REFERENCES targets(id),
+            ok INTEGER NOT NULL,
+            latency_ms REAL,
+            jitter_ms REAL,
+            packet_loss_pct REAL,
+            status_code INTEGER,
+            bytes INTEGER,
+            throughput_mbps REAL,
+            error TEXT,
+            created_at_utc TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        );
+        INSERT INTO samples (
+            id, timestamp_utc, local_time, target_id, ok,
+            latency_ms, jitter_ms, packet_loss_pct, status_code,
+            bytes, throughput_mbps, error, created_at_utc
+        )
+        SELECT s.id, s.timestamp_utc, s.local_time, t.id, s.ok,
+               s.latency_ms, s.jitter_ms, s.packet_loss_pct, s.status_code,
+               s.bytes, s.throughput_mbps, s.error, s.created_at_utc
+        FROM samples_legacy s
+        JOIN targets t ON t.check_type = s.check_type AND t.target = s.target;
+        DROP TABLE samples_legacy;
+        """
+    )
+
+
+def get_target_id(conn: sqlite3.Connection, check_type: str, target: str) -> int:
+    conn.execute(
+        "INSERT OR IGNORE INTO targets(check_type, target) VALUES (?, ?)",
+        (check_type, target),
+    )
+    row = conn.execute(
+        "SELECT id FROM targets WHERE check_type = ? AND target = ?",
+        (check_type, target),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError(f"failed to resolve target id for {check_type}:{target}")
+    return int(row[0])
 
 
 def append_rows_sqlite(db_path: Path, rows: Iterable[Dict[str, Any]]) -> None:
     init_sqlite(db_path)
-    values = []
-    for row in rows:
-        values.append(
-            (
-                row.get("timestamp_utc"),
-                row.get("local_time"),
-                row.get("check_type"),
-                row.get("target"),
-                1 if row.get("ok") else 0,
-                row.get("latency_ms"),
-                row.get("jitter_ms"),
-                row.get("packet_loss_pct"),
-                row.get("status_code"),
-                row.get("bytes"),
-                row.get("throughput_mbps"),
-                row.get("error"),
-            )
-        )
-    if not values:
-        return
     with sqlite3.connect(db_path) as conn:
+        values = []
+        for row in rows:
+            target_id = get_target_id(conn, str(row.get("check_type")), str(row.get("target")))
+            values.append(
+                (
+                    row.get("timestamp_utc"),
+                    row.get("local_time"),
+                    target_id,
+                    1 if row.get("ok") else 0,
+                    row.get("latency_ms"),
+                    row.get("jitter_ms"),
+                    row.get("packet_loss_pct"),
+                    row.get("status_code"),
+                    row.get("bytes"),
+                    row.get("throughput_mbps"),
+                    row.get("error"),
+                )
+            )
+        if not values:
+            return
         conn.executemany(
             """
             INSERT INTO samples (
-                timestamp_utc, local_time, check_type, target, ok,
+                timestamp_utc, local_time, target_id, ok,
                 latency_ms, jitter_ms, packet_loss_pct, status_code,
                 bytes, throughput_mbps, error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             values,
         )
@@ -378,7 +506,7 @@ def build_report(db_path: Path, since: str = "", limit_series: int = 2000) -> Di
         ).fetchone()
         by_check_rows = conn.execute(
             f"""
-            SELECT check_type,
+            SELECT t.check_type AS check_type,
                    COUNT(*) AS samples,
                    SUM(CASE WHEN ok THEN 0 ELSE 1 END) AS failures,
                    AVG(latency_ms) AS latency_avg_ms,
@@ -386,46 +514,56 @@ def build_report(db_path: Path, since: str = "", limit_series: int = 2000) -> Di
                    MAX(latency_ms) AS latency_max_ms,
                    AVG(packet_loss_pct) AS packet_loss_avg_pct,
                    AVG(throughput_mbps) AS throughput_avg_mbps
-            FROM samples {where}
-            GROUP BY check_type
-            ORDER BY check_type
+            FROM samples s
+            JOIN targets t ON t.id = s.target_id
+            {where}
+            GROUP BY t.check_type
+            ORDER BY t.check_type
             """,
             params,
         ).fetchall()
         by_target_rows = conn.execute(
             f"""
-            SELECT check_type, target,
+            SELECT t.check_type AS check_type, t.target AS target,
                    COUNT(*) AS samples,
                    SUM(CASE WHEN ok THEN 0 ELSE 1 END) AS failures,
                    AVG(latency_ms) AS latency_avg_ms,
                    AVG(packet_loss_pct) AS packet_loss_avg_pct,
                    AVG(throughput_mbps) AS throughput_avg_mbps
-            FROM samples {where}
-            GROUP BY check_type, target
-            ORDER BY check_type, target
+            FROM samples s
+            JOIN targets t ON t.id = s.target_id
+            {where}
+            GROUP BY t.check_type, t.target
+            ORDER BY t.check_type, t.target
             """,
             params,
         ).fetchall()
         series_rows = conn.execute(
             f"""
-            SELECT timestamp_utc, check_type, target, ok, latency_ms,
+            SELECT s.timestamp_utc, t.check_type AS check_type, t.target AS target, s.ok, s.latency_ms,
                    packet_loss_pct, throughput_mbps, error
-            FROM samples {where}
-            ORDER BY timestamp_utc DESC, id DESC
+            FROM samples s
+            JOIN targets t ON t.id = s.target_id
+            {where}
+            ORDER BY s.timestamp_utc DESC, s.id DESC
             LIMIT ?
             """,
             (*params, limit_series),
         ).fetchall()
         recent_failures = conn.execute(
             f"""
-            SELECT timestamp_utc, check_type, target, latency_ms, packet_loss_pct, error
-            FROM samples {where} AND ok = 0
-            ORDER BY timestamp_utc DESC, id DESC
+            SELECT s.timestamp_utc, t.check_type AS check_type, t.target AS target, s.latency_ms, s.packet_loss_pct, s.error
+            FROM samples s
+            JOIN targets t ON t.id = s.target_id
+            {where} AND s.ok = 0
+            ORDER BY s.timestamp_utc DESC, s.id DESC
             LIMIT 20
             """ if since else """
-            SELECT timestamp_utc, check_type, target, latency_ms, packet_loss_pct, error
-            FROM samples WHERE ok = 0
-            ORDER BY timestamp_utc DESC, id DESC
+            SELECT s.timestamp_utc, t.check_type AS check_type, t.target AS target, s.latency_ms, s.packet_loss_pct, s.error
+            FROM samples s
+            JOIN targets t ON t.id = s.target_id
+            WHERE s.ok = 0
+            ORDER BY s.timestamp_utc DESC, s.id DESC
             LIMIT 20
             """,
             params,
@@ -637,7 +775,9 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--http-urls", default=",".join(DEFAULT_HTTP_URLS), help="Comma-separated HTTP(S) URLs. Use empty string to disable.")
     p.add_argument("--download-url", default=DEFAULT_DOWNLOAD_URL, help="URL for small throughput test. Use empty string to disable.")
     p.add_argument("--download-bytes", type=int, default=1_000_000, help="Maximum bytes to read for throughput test.")
+    p.add_argument("--download-every", type=float, default=0.0, help="Run download checks at most once every N seconds. Default 0 keeps the old behavior: every sample.")
     p.add_argument("--quiet", action="store_true", help="Do not print per-sample summaries.")
+    p.add_argument("--estimate-storage", action="store_true", help="Estimate one-year storage and download traffic for the current configuration, then exit.")
     p.add_argument("--report", choices=("text", "json"), help="Print a statistics report from the SQLite database and exit.")
     p.add_argument("--html-report", default="", help="Write a self-contained HTML visualization report and exit.")
     p.add_argument("--since", default="", help="Only include samples with timestamp_utc >= this ISO timestamp in reports.")
@@ -649,6 +789,8 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         args.ping_count = 1
     if args.interval < 1:
         args.interval = 1
+    if args.download_every < 0:
+        args.download_every = 0
     return args
 
 
@@ -658,6 +800,9 @@ def main(argv: List[str]) -> int:
     args = parse_args(argv)
     out_dir = Path(args.out_dir).expanduser().resolve()
     db_path = Path(args.db_path).expanduser().resolve() if args.db_path else out_dir / "connection-quality.sqlite"
+    if args.estimate_storage:
+        print(format_storage_estimate(estimate_storage(args)))
+        return 0
     if args.report or args.html_report:
         report = build_report(db_path, since=args.since)
         if args.report == "json":
@@ -676,9 +821,12 @@ def main(argv: List[str]) -> int:
     if args.storage in ("files", "both"):
         write_metadata(out_dir, args)
 
+    started_monitor = time.monotonic()
+    sample_number = 0
     while not STOP:
         started = time.monotonic()
-        rows = sample(args)
+        elapsed_monitor = started - started_monitor
+        rows = sample(args, include_download=should_run_download(args, sample_number, elapsed_monitor))
         if args.storage in ("sqlite", "both"):
             append_rows_sqlite(db_path, rows)
         if args.storage in ("files", "both"):
@@ -687,6 +835,7 @@ def main(argv: List[str]) -> int:
             print_summary(rows)
         if args.once:
             break
+        sample_number += 1
         elapsed = time.monotonic() - started
         sleep_for = max(0.0, args.interval - elapsed)
         end = time.monotonic() + sleep_for
