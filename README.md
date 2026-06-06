@@ -100,7 +100,9 @@ To also keep daily CSV/JSONL files, add `--storage both` to the service `ExecSta
 --http-urls LIST           Comma-separated HTTP(S) URLs; empty disables HTTP
 --download-url URL         URL for small throughput test; empty disables download
 --download-bytes N         Max bytes for throughput test, default 1000000
+--download-every N         Run download checks at most every N seconds; 0 means every sample
 --quiet                    Do not print per-sample summaries
+--estimate-storage         Estimate one-year storage/traffic for the current config and exit
 --report text|json         Print statistics from SQLite and exit
 --html-report PATH         Write a self-contained HTML visualization and exit
 --since ISO_TIMESTAMP      Restrict reports to samples at/after this timestamp
@@ -114,6 +116,46 @@ connection-quality-monitor \
   --ping-targets 1.1.1.1,8.8.8.8,your.router.ip \
   --dns-hosts cloudflare.com,google.com \
   --out-dir ~/connection-quality-data
+```
+
+Estimate the one-year storage and download traffic cost for a configuration:
+
+```bash
+connection-quality-monitor \
+  --interval 60 \
+  --ping-targets 1.1.1.1,8.8.8.8 \
+  --dns-hosts cloudflare.com \
+  --http-urls https://www.google.com/generate_204 \
+  --download-url "" \
+  --estimate-storage
+```
+
+Run cheap checks every minute but throughput checks only every 15 minutes:
+
+```bash
+connection-quality-monitor --interval 60 --download-every 900
+```
+
+The default `--download-every 0` preserves the original behavior: the download
+test runs every sample when `--download-url` is configured.
+
+## Storage efficiency
+
+SQLite stores repeated check targets in a normalized `targets` table and stores
+only `target_id` on each sample row. This reduces repeated URL/hostname text in
+long-running databases while keeping reports readable.
+
+For low-storage, low-traffic long-running monitoring, prefer SQLite only and
+disable or slow down download checks:
+
+```bash
+connection-quality-monitor \
+  --storage sqlite \
+  --interval 60 \
+  --ping-targets 1.1.1.1,8.8.8.8 \
+  --dns-hosts cloudflare.com \
+  --http-urls https://www.google.com/generate_204 \
+  --download-url ""
 ```
 
 ## Reporting and visualization
@@ -150,14 +192,14 @@ The SQLite database is easiest to query locally. Example:
 
 ```bash
 sqlite3 /var/log/connection-quality/connection-quality.sqlite \
-  "SELECT timestamp_utc, check_type, target, ok, latency_ms, packet_loss_pct, throughput_mbps, error FROM samples ORDER BY id DESC LIMIT 20;"
+  "SELECT s.timestamp_utc, t.check_type, t.target, s.ok, s.latency_ms, s.packet_loss_pct, s.throughput_mbps, s.error FROM samples s JOIN targets t ON t.id = s.target_id ORDER BY s.id DESC LIMIT 20;"
 ```
 
 If your ISP wants spreadsheet-style evidence, either export from SQLite:
 
 ```bash
 sqlite3 -header -csv /var/log/connection-quality/connection-quality.sqlite \
-  "SELECT * FROM samples;" > connection-quality.csv
+  "SELECT s.timestamp_utc, s.local_time, t.check_type, t.target, s.ok, s.latency_ms, s.jitter_ms, s.packet_loss_pct, s.status_code, s.bytes, s.throughput_mbps, s.error FROM samples s JOIN targets t ON t.id = s.target_id;" > connection-quality.csv
 ```
 
 Or run the monitor with `--storage both` to create daily CSV files automatically.
